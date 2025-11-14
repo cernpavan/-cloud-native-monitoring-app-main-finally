@@ -1,0 +1,321 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>System Monitoring — Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    :root{--card-bg:#fff;--bg:#f4f6fb;--muted:#6b7280;--danger:#ef4444}
+    body{font-family:Inter,Arial,Helvetica,sans-serif;background:var(--bg);color:#0f172a;margin:0;padding:20px}
+    header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px}
+    h1{margin:0;font-size:1.4rem}
+    .muted{color:var(--muted);font-size:0.95rem}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
+    @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}}
+    @media (max-width:640px){.grid{grid-template-columns:1fr}}
+    .card{background:var(--card-bg);padding:14px;border-radius:10px;box-shadow:0 4px 18px rgba(15,23,42,0.06);min-height:120px}
+    .card h3{margin:0 0 8px 0;font-size:1rem}
+    .flex-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .small{font-size:0.9rem;color:var(--muted)}
+    .alert{background:#fff6f6;border:1px solid rgba(239,68,68,0.12);color:var(--danger);padding:8px;border-radius:8px;margin-top:10px}
+    #net-chart{height:180px}
+    table{width:100%;border-collapse:collapse;font-size:0.9rem}
+    th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #eef2f7}
+    .muted-sm{color:var(--muted);font-size:0.85rem}
+    .mini-table td, .mini-table th{padding:4px 6px;font-size:0.82rem}
+    .row-flex{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Cloud Native — System Monitoring</h1>
+      <div class="muted small">Live metrics · Auto-refresh every 5s · <span id="ts">-</span></div>
+    </div>
+    <div class="muted small" id="host-info">loading system info…</div>
+  </header>
+
+  <div class="grid" id="overview">
+    <div class="card">
+      <h3>CPU</h3>
+      <div id="cpu-gauge"></div>
+      <div class="small muted-sm">Per-CPU: <span id="per-cpu">-</span></div>
+      <div class="small muted-sm">Load: <span id="load-avg">-</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Memory</h3>
+      <div id="mem-gauge"></div>
+      <div class="small muted-sm">Swap: <span id="swap">-</span></div>
+      <div class="small muted-sm">Available: <span id="mem-available">-</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Disk (max used)</h3>
+      <div id="disk-gauge"></div>
+      <div class="small muted-sm" id="disk-details">-</div>
+    </div>
+
+    <div class="card" style="grid-column: span 2;">
+      <h3>Network I/O (live)</h3>
+      <div id="net-chart"></div>
+      <div class="small muted-sm">Total connections: <span id="connections">-</span></div>
+      <div class="small muted-sm">Totals: <span id="net-totals">-</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Top Processes (CPU)</h3>
+      <div id="proc-table"></div>
+    </div>
+
+    <div class="card">
+      <h3>Top Processes (Memory)</h3>
+      <div id="proc-mem-table"></div>
+    </div>
+
+    <div class="card">
+      <h3>Disk I/O</h3>
+      <div class="small muted-sm">Read/s: <span id="disk-read-s">-</span></div>
+      <div class="small muted-sm">Write/s: <span id="disk-write-s">-</span></div>
+      <div class="small muted-sm">Totals: <span id="disk-io-tot">-</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Per-NIC Speeds</h3>
+      <div id="per-nic"></div>
+    </div>
+
+    <div class="card">
+      <h3>GPU</h3>
+      <div id="gpu-info" class="small muted-sm">No GPU detected or GPUtil not installed.</div>
+    </div>
+
+    <div class="card">
+      <h3>Battery & Time</h3>
+      <div class="small muted-sm">Battery: <span id="battery">-</span></div>
+      <div class="small muted-sm">Boot time: <span id="uptime-boot">-</span></div>
+      <div class="small muted-sm">Local time: <span id="local-time">-</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Interfaces</h3>
+      <div id="interfaces"></div>
+    </div>
+
+    <div class="card">
+      <h3>Page Faults</h3>
+      <div class="small muted-sm">System total (if available): <span id="page-faults">-</span></div>
+    </div>
+  </div>
+
+  <div id="alert-box"></div>
+
+  <script>
+    const refreshMs = 5000;
+    const netHistoryMax = 48; // larger history
+    const netState = { xs: [], sent_s: [], recv_s: [], _lastTotals: null };
+
+    function fmtBytes(v){
+      if(v === null || v === undefined) return '-';
+      if(v < 1024) return v + ' B';
+      if(v < 1024*1024) return (v/1024).toFixed(2) + ' KB';
+      if(v < 1024*1024*1024) return (v/1024/1024).toFixed(2) + ' MB';
+      return (v/1024/1024/1024).toFixed(2) + ' GB';
+    }
+
+    function makeGauge(value, title){
+      return {
+        type: "indicator",
+        mode: "gauge+number",
+        value: value,
+        domain: { x: [0,1], y: [0,1] },
+        gauge:{
+          axis:{ range: [0,100], tickmode:"auto" },
+          bar:{ thickness: 0.35 },
+          steps:[
+            { range:[0,50], color:"#dff7d9"},
+            { range:[50,85], color:"#fff2cc"},
+            { range:[85,100], color:"#ffe2e2"}
+          ],
+          threshold:{ line:{ color:"red", width:4 }, thickness:0.75, value:85 }
+        },
+        title:{ text: title, font:{ size:12 } },
+        number:{ suffix:"%" }
+      };
+    }
+
+    Plotly.newPlot('cpu-gauge', [makeGauge(0,'CPU')], { margin:{t:10,b:10,l:10,r:10}, height:160 });
+    Plotly.newPlot('mem-gauge', [makeGauge(0,'Memory')], { margin:{t:10,b:10,l:10,r:10}, height:160 });
+    Plotly.newPlot('disk-gauge', [makeGauge(0,'Disk')], { margin:{t:10,b:10,l:10,r:10}, height:160 });
+
+    Plotly.newPlot('net-chart', [
+      { x: [], y: [], name: 'Bytes Sent/s', mode:'lines+markers' },
+      { x: [], y: [], name: 'Bytes Recv/s', mode:'lines+markers' }
+    ], {
+      margin:{t:20,b:30,l:40,r:10},
+      height:180,
+      xaxis:{ showgrid:false, tickformat:"%H:%M:%S" },
+      yaxis:{ automargin:true, title:'B/s' }
+    });
+
+    async function fetchMetrics(){
+      try{
+        const res = await fetch('/api/metrics');
+        if(!res.ok) throw new Error('fetch failed');
+        const j = await res.json();
+
+        const ts = new Date(j.timestamp || new Date().toISOString());
+        document.getElementById('ts').innerText = ts.toLocaleString();
+        document.getElementById('local-time').innerText = new Date().toLocaleString();
+
+        // CPU
+        const cpuVal = Number((j.cpu && j.cpu.cpu_percent) || 0);
+        Plotly.react('cpu-gauge', [makeGauge(cpuVal,'CPU')], { margin:{t:10,b:10,l:10,r:10}, height:160 });
+        document.getElementById('per-cpu').innerText = (j.cpu && j.cpu.per_cpu) ? j.cpu.per_cpu.map(p=>p+'%').join(', ') : '-';
+        document.getElementById('load-avg').innerText = j.cpu && j.cpu.load_avg ? `1m:${j.cpu.load_avg['1']} 5m:${j.cpu.load_avg['5']} 15m:${j.cpu.load_avg['15']}` : '-';
+
+        // Memory
+        const memVal = Number((j.memory && j.memory.virtual_percent) || 0);
+        Plotly.react('mem-gauge', [makeGauge(memVal,'Memory')], { margin:{t:10,b:10,l:10,r:10}, height:160 });
+        document.getElementById('swap').innerText = `${(j.memory && j.memory.swap_percent) || 0}%`;
+        document.getElementById('mem-available').innerText = j.memory && j.memory.virtual_available ? fmtBytes(j.memory.virtual_available) : '-';
+        document.getElementById('page-faults').innerText = j.page_faults_total != null ? j.page_faults_total : (j.memory && j.memory.page_faults != null ? j.memory.page_faults : '-');
+
+        // Disks
+        let maxDisk = 0, maxInfo = null;
+        if(Array.isArray(j.disks)){
+          j.disks.forEach(d => { if((d.percent||0) > maxDisk){ maxDisk = d.percent; maxInfo = d; }});
+        }
+        Plotly.react('disk-gauge', [makeGauge(maxDisk,'Disk Max')], { margin:{t:10,b:10,l:10,r:10}, height:160 });
+        document.getElementById('disk-details').innerText = maxInfo ? `${maxInfo.mountpoint} · ${maxInfo.percent}% · ${maxInfo.fstype || '-'} · ${fmtBytes(maxInfo.total)}` : '-';
+
+        // Network totals & speeds
+        const totals = j.network_totals || {};
+        const netSpeeds = j.network_speeds || {};
+        const perNic = j.per_nic_speeds || {};
+
+        const sent_s = netSpeeds.bytes_sent_per_sec ?? null;
+        const recv_s = netSpeeds.bytes_recv_per_sec ?? null;
+
+        const nowMs = ts.getTime();
+        let usedSent = sent_s, usedRecv = recv_s;
+
+        if(usedSent === null || usedRecv === null){
+          const last = netState.xs.length ? netState.xs[netState.xs.length-1] : null;
+          if(last){
+            const dt = (nowMs - last)/1000 || 1;
+            const lastSentTotal = netState._lastTotals ? netState._lastTotals.sent : null;
+            const lastRecvTotal = netState._lastTotals ? netState._lastTotals.recv : null;
+            if(totals.bytes_sent != null && lastSentTotal != null){
+              usedSent = Math.max(0, (totals.bytes_sent - lastSentTotal)/dt);
+            }
+            if(totals.bytes_recv != null && lastRecvTotal != null){
+              usedRecv = Math.max(0, (totals.bytes_recv - lastRecvTotal)/dt);
+            }
+          }
+        }
+
+        netState.xs.push(nowMs);
+        netState.sent_s.push(usedSent || 0);
+        netState.recv_s.push(usedRecv || 0);
+        netState._lastTotals = { sent: totals.bytes_sent ?? netState._lastTotals?.sent, recv: totals.bytes_recv ?? netState._lastTotals?.recv };
+
+        if(netState.xs.length > netHistoryMax){
+          netState.xs.shift(); netState.sent_s.shift(); netState.recv_s.shift();
+        }
+
+        const xs = netState.xs.map(t => new Date(t));
+        Plotly.react('net-chart', [
+          { x: xs, y: netState.sent_s, name: 'Bytes Sent/s', mode:'lines+markers', hovertemplate: '%{y:.0f} B/s' },
+          { x: xs, y: netState.recv_s, name: 'Bytes Recv/s', mode:'lines+markers', hovertemplate: '%{y:.0f} B/s' }
+        ], { margin:{t:20,b:30,l:40,r:10}, height:180 });
+
+        document.getElementById('connections').innerText = j.connections_count || 0;
+        document.getElementById('net-totals').innerText = `Sent: ${fmtBytes(totals.bytes_sent||0)} · Recv: ${fmtBytes(totals.bytes_recv||0)}`;
+
+        // Per-NIC table
+        let perNicHtml = '<table class="mini-table"><thead><tr><th>NIC</th><th>Tx/s</th><th>Rx/s</th><th>pkts tx</th><th>pkts rx</th></tr></thead><tbody>';
+        if(Object.keys(perNic).length){
+          for(const nic of Object.keys(perNic)){
+            const n = perNic[nic] || {};
+            perNicHtml += `<tr><td>${nic}</td><td>${fmtBytes(Math.round(n.bytes_sent_per_sec || 0))}/s</td><td>${fmtBytes(Math.round(n.bytes_recv_per_sec || 0))}/s</td><td>${n.packets_sent ?? '-'}</td><td>${n.packets_recv ?? '-'}</td></tr>`;
+          }
+        } else {
+          perNicHtml += '<tr><td colspan="5">No per-NIC data</td></tr>';
+        }
+        perNicHtml += '</tbody></table>';
+        document.getElementById('per-nic').innerHTML = perNicHtml;
+
+        // Disk IO speeds & totals
+        const diskSpeeds = j.disk_io_speeds || {};
+        const diskTotals = j.disk_io_totals || {};
+        document.getElementById('disk-read-s').innerText = fmtBytes(Math.round(diskSpeeds.read_bytes_per_sec || 0)) + '/s';
+        document.getElementById('disk-write-s').innerText = fmtBytes(Math.round(diskSpeeds.write_bytes_per_sec || 0)) + '/s';
+        document.getElementById('disk-io-tot').innerText = `Read: ${fmtBytes(diskTotals.read_bytes||0)} (${diskTotals.read_count||'-'} ops) · Write: ${fmtBytes(diskTotals.write_bytes||0)} (${diskTotals.write_count||'-'} ops)`;
+
+        // Top CPU procs
+        const procs = j.top_processes_cpu || [];
+        const procHtml = `<table><thead><tr><th>PID</th><th>Name / Cmd</th><th>CPU%</th><th>Mem%</th></tr></thead><tbody>${procs.map(p=>`<tr><td>${p.pid}</td><td>${p.name||(p.cmdline&&p.cmdline.join(' '))||'-'}</td><td>${(p.cpu_percent||0).toFixed(1)}</td><td>${(p.memory_percent||0).toFixed(2)}</td></tr>`).join('')}</tbody></table>`;
+        document.getElementById('proc-table').innerHTML = procHtml;
+
+        // Top Memory procs
+        const procsM = j.top_processes_mem || [];
+        const procMHtml = `<table><thead><tr><th>PID</th><th>Name / Cmd</th><th>Mem%</th><th>PageFaults</th></tr></thead><tbody>${procsM.map(p=>`<tr><td>${p.pid}</td><td>${p.name||(p.cmdline&&p.cmdline.join(' '))||'-'}</td><td>${(p.memory_percent||0).toFixed(2)}</td><td>${p.page_faults!=null?p.page_faults:'-'}</td></tr>`).join('')}</tbody></table>`;
+        document.getElementById('proc-mem-table').innerHTML = procMHtml;
+
+        // Host info & uptime
+        const si = j.system_info || {};
+        const ipList = (si.ip_addresses || []).map(x=>`${x.iface}:${x.address}`).join(', ');
+        document.getElementById('host-info').innerText = `${si.hostname || '-'} · ${ipList || '-'}`;
+        document.getElementById('uptime-boot').innerText = j.uptime_boot_time || '-';
+
+        // GPU info
+        const gpus = j.gpu || [];
+        if(Array.isArray(gpus) && gpus.length){
+          const ghtml = gpus.map(g => `<div><strong>${g.name}</strong> · Load:${g.load}% · Mem:${g.memory_used}/${g.memory_total} MB (${g.memory_util_percent}%) ${g.temperature ? '· T:'+g.temperature+'°C':''}</div>`).join('');
+          document.getElementById('gpu-info').innerHTML = ghtml;
+        } else {
+          document.getElementById('gpu-info').innerText = 'No GPU detected or GPUtil not installed.';
+        }
+
+        // Battery & time
+        const batt = j.battery || {};
+        if(batt.present){
+          document.getElementById('battery').innerText = `${batt.percent}% · Plugged: ${batt.power_plugged ? 'Yes' : 'No'} · secs left: ${batt.secsleft}`;
+        } else {
+          document.getElementById('battery').innerText = 'No battery or not supported';
+        }
+
+        // Interfaces list
+        const ifs = j.interfaces || [];
+        let ifHtml = '<table class="mini-table"><thead><tr><th>Iface</th><th>MAC</th><th>IPs</th><th>Up</th><th>Speed</th></tr></thead><tbody>';
+        ifs.forEach(i => {
+          ifHtml += `<tr><td>${i.iface}</td><td>${i.mac||'-'}</td><td>${(i.ips||[]).join(', ')||'-'}</td><td>${i.is_up? 'yes':'no'}</td><td>${i.speed || '-'}</td></tr>`;
+        });
+        ifHtml += '</tbody></table>';
+        document.getElementById('interfaces').innerHTML = ifHtml;
+
+        // Alerts
+        const alertBox = document.getElementById('alert-box');
+        let msg = j.message || null;
+        if(cpuVal > 85 || memVal > 85 || (maxDisk||0) > 92){
+          msg = msg || 'High resource usage detected — consider scaling or investigating.';
+        }
+        if(msg){
+          alertBox.innerHTML = `<div class="alert">${msg}</div>`;
+        } else {
+          alertBox.innerHTML = '';
+        }
+
+      } catch(err){
+        console.error('metrics error', err);
+      }
+    }
+
+    fetchMetrics();
+    setInterval(fetchMetrics, refreshMs);
+  </script>
+</body>
+</html>
